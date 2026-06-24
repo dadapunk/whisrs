@@ -14,8 +14,7 @@ const EV_KEY: u16 = 0x01;
 
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_RIGHTCTRL: u16 = 97;
-const KEY_LEFTSUPER: u16 = 125;
-const KEY_RIGHTSUPER: u16 = 126;
+const KEY_ENTER: u16 = 28;
 
 #[repr(C, packed)]
 struct InputEvent {
@@ -47,7 +46,7 @@ fn find_event_devices() -> Vec<String> {
 
 fn main() {
     let ctrl = Arc::new(AtomicBool::new(false));
-    let super_key = Arc::new(AtomicBool::new(false));
+    let enter = Arc::new(AtomicBool::new(false));
     let recording = Arc::new(AtomicBool::new(false));
 
     loop {
@@ -64,7 +63,7 @@ fn main() {
         for path_str in devices {
             let path = path_str;
             let ctrl = ctrl.clone();
-            let super_key = super_key.clone();
+            let enter = enter.clone();
             let recording = recording.clone();
 
             handles.push(thread::spawn(move || loop {
@@ -92,11 +91,11 @@ fn main() {
                     }
 
                     let is_ctrl = event.code == KEY_LEFTCTRL || event.code == KEY_RIGHTCTRL;
-                    let is_super = event.code == KEY_LEFTSUPER || event.code == KEY_RIGHTSUPER;
+                    let is_enter = event.code == KEY_ENTER;
 
                     if is_ctrl {
                         if value != 0 && !ctrl.swap(true, Ordering::SeqCst) {
-                            if super_key.load(Ordering::SeqCst)
+                            if enter.load(Ordering::SeqCst)
                                 && !recording.swap(true, Ordering::SeqCst)
                             {
                                 let _ = Command::new(WHISRS).args(["toggle"]).spawn();
@@ -108,14 +107,14 @@ fn main() {
                         }
                     }
 
-                    if is_super {
-                        if value != 0 && !super_key.swap(true, Ordering::SeqCst) {
+                    if is_enter {
+                        if value != 0 && !enter.swap(true, Ordering::SeqCst) {
                             if ctrl.load(Ordering::SeqCst)
                                 && !recording.swap(true, Ordering::SeqCst)
                             {
                                 let _ = Command::new(WHISRS).args(["toggle"]).spawn();
                             }
-                        } else if value == 0 && super_key.swap(false, Ordering::SeqCst) {
+                        } else if value == 0 && enter.swap(false, Ordering::SeqCst) {
                             if recording.swap(false, Ordering::SeqCst) {
                                 let _ = Command::new(WHISRS).args(["toggle"]).spawn();
                             }
