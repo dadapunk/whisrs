@@ -2,10 +2,11 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const WHISRS_SOCK: &str = "/run/user/1000/whisrs.sock";
 
@@ -32,6 +33,12 @@ fn send_toggle() {
         let _ = sock.write_all(&len);
         let _ = sock.write_all(body);
     }
+}
+
+fn play_beep() {
+    let _ = Command::new("paplay")
+        .arg("/usr/share/sounds/freedesktop/stereo/bell.oga")
+        .spawn();
 }
 
 fn find_keyboards() -> Vec<String> {
@@ -63,7 +70,6 @@ fn main() {
     let ctrl = Arc::new(AtomicBool::new(false));
     let alt = Arc::new(AtomicBool::new(false));
     let recording = Arc::new(AtomicBool::new(false));
-    let last_toggle = Arc::new(std::sync::Mutex::new(Instant::now()));
 
     loop {
         let keyboards = find_keyboards();
@@ -81,7 +87,6 @@ fn main() {
             let ctrl = ctrl.clone();
             let alt = alt.clone();
             let recording = recording.clone();
-            let last_toggle = last_toggle.clone();
 
             handles.push(thread::spawn(move || loop {
                 let mut file = match File::open(&path) {
@@ -110,37 +115,24 @@ fn main() {
                     let is_ctrl = event.code == KEY_LEFTCTRL || event.code == KEY_RIGHTCTRL;
                     let is_alt = event.code == KEY_LEFTALT || event.code == KEY_RIGHTALT;
 
-                    let toggle = |rec: &AtomicBool| {
-                        let mut last = last_toggle.lock().unwrap();
-                        if last.elapsed() < Duration::from_millis(200) {
-                            return;
-                        }
-                        *last = Instant::now();
-                        drop(last);
-                        let was = rec.swap(!rec.load(Ordering::SeqCst), Ordering::SeqCst);
-                        if was {
-                            send_toggle();
-                        }
-                    };
-
                     if is_ctrl {
                         ctrl.store(value != 0, Ordering::SeqCst);
-                        if value == 0 && recording.load(Ordering::SeqCst) {
-                            toggle(&recording);
-                        }
                     }
-
                     if is_alt {
                         alt.store(value != 0, Ordering::SeqCst);
-                        if value == 0 && recording.load(Ordering::SeqCst) {
-                            toggle(&recording);
+                    }
+
+                    // Ctrl+Alt presionado → iniciar grabación
+                    if value == 1 && ctrl.load(Ordering::SeqCst) && alt.load(Ordering::SeqCst) {
+                        if !recording.swap(true, Ordering::SeqCst) {
+                            send_toggle();
+                            play_beep();
                         }
                     }
 
-                    if value != 0 && ctrl.load(Ordering::SeqCst) && alt.load(Ordering::SeqCst) {
-                        if !recording.load(Ordering::SeqCst) {
-                            toggle(&recording);
-                        }
+                    // Soltar Ctrl o Alt → detener grabación
+                    if value == 0 && recording.swap(false, Ordering::SeqCst) {
+                        send_toggle();
                     }
                 }
             }));
