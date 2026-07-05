@@ -27,8 +27,10 @@ struct InputEvent {
 
 fn send_toggle() {
     if let Ok(mut sock) = UnixStream::connect(WHISRS_SOCK) {
-        let msg = b"\x00\x00\x00\x11{\"cmd\":\"toggle\"}";
-        let _ = sock.write_all(msg);
+        let body = br#"{"cmd":"toggle"}"#;
+        let len = (body.len() as u32).to_be_bytes();
+        let _ = sock.write_all(&len);
+        let _ = sock.write_all(body);
     }
 }
 
