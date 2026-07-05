@@ -1,14 +1,13 @@
 use std::fs;
 use std::fs::File;
-use std::io::Read;
-use std::mem;
-use std::process::Command;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const WHISRS: &str = "/home/dada/.local/bin/whisrs";
+const WHISRS_SOCK: &str = "/run/user/1000/whisrs.sock";
 
 const EV_KEY: u16 = 0x01;
 
@@ -17,7 +16,7 @@ const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTALT: u16 = 100;
 
-#[repr(C, packed)]
+#[repr(C)]
 struct InputEvent {
     _tv_sec: i64,
     _tv_usec: i64,
@@ -26,20 +25,33 @@ struct InputEvent {
     value: i32,
 }
 
-fn find_event_devices() -> Vec<String> {
+fn send_toggle() {
+    if let Ok(mut sock) = UnixStream::connect(WHISRS_SOCK) {
+        let msg = b"\x00\x00\x00\x11{\"cmd\":\"toggle\"}";
+        let _ = sock.write_all(msg);
+    }
+}
+
+fn find_keyboards() -> Vec<String> {
     let mut devices = vec![];
-    let dir = match fs::read_dir("/dev/input") {
+    let dir = match fs::read_dir("/sys/class/input") {
         Ok(d) => d,
         Err(_) => return devices,
     };
     for entry in dir.flatten() {
-        let path = entry.path();
-        let fname = match path.file_name() {
-            Some(n) => n.to_string_lossy().to_string(),
-            None => continue,
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
         };
-        if fname.starts_with("event") {
-            devices.push(path.to_string_lossy().to_string());
+        if !name.starts_with("event") {
+            continue;
+        }
+        let name_path = entry.path().join("device/name");
+        if let Ok(dev_name) = fs::read_to_string(&name_path) {
+            let n = dev_name.trim().to_lowercase();
+            if n.contains("keyboard") || n.contains("kbd") || n.contains("at translated") {
+                devices.push(format!("/dev/input/{}", name));
+            }
         }
     }
     devices
@@ -49,23 +61,25 @@ fn main() {
     let ctrl = Arc::new(AtomicBool::new(false));
     let alt = Arc::new(AtomicBool::new(false));
     let recording = Arc::new(AtomicBool::new(false));
+    let last_toggle = Arc::new(std::sync::Mutex::new(Instant::now()));
 
     loop {
-        let devices = find_event_devices();
-        if devices.is_empty() {
-            eprintln!("no event devices found, retrying in 5s...");
+        let keyboards = find_keyboards();
+        if keyboards.is_empty() {
+            eprintln!("no keyboards found, retrying in 5s...");
             thread::sleep(Duration::from_secs(5));
             continue;
         }
 
-        eprintln!("monitoring {} event device(s)", devices.len());
+        eprintln!("monitoring {} keyboard(s)", keyboards.len());
         let mut handles = vec![];
 
-        for path_str in devices {
+        for path_str in keyboards {
             let path = path_str;
             let ctrl = ctrl.clone();
             let alt = alt.clone();
             let recording = recording.clone();
+            let last_toggle = last_toggle.clone();
 
             handles.push(thread::spawn(move || loop {
                 let mut file = match File::open(&path) {
@@ -82,7 +96,7 @@ fn main() {
                         eprintln!("{path}: {e}, re-enumerating...");
                         break;
                     }
-                    let event: InputEvent = unsafe { mem::transmute(buf) };
+                    let event: InputEvent = unsafe { std::ptr::read(buf.as_ptr() as *const _) };
                     if event.event_type != EV_KEY {
                         continue;
                     }
@@ -94,30 +108,36 @@ fn main() {
                     let is_ctrl = event.code == KEY_LEFTCTRL || event.code == KEY_RIGHTCTRL;
                     let is_alt = event.code == KEY_LEFTALT || event.code == KEY_RIGHTALT;
 
+                    let toggle = |rec: &AtomicBool| {
+                        let mut last = last_toggle.lock().unwrap();
+                        if last.elapsed() < Duration::from_millis(200) {
+                            return;
+                        }
+                        *last = Instant::now();
+                        drop(last);
+                        let was = rec.swap(!rec.load(Ordering::SeqCst), Ordering::SeqCst);
+                        if was {
+                            send_toggle();
+                        }
+                    };
+
                     if is_ctrl {
-                        if value != 0 && !ctrl.swap(true, Ordering::SeqCst) {
-                            if alt.load(Ordering::SeqCst) && !recording.swap(true, Ordering::SeqCst)
-                            {
-                                let _ = Command::new(WHISRS).args(["toggle"]).spawn();
-                            }
-                        } else if value == 0 && ctrl.swap(false, Ordering::SeqCst) {
-                            if recording.swap(false, Ordering::SeqCst) {
-                                let _ = Command::new(WHISRS).args(["toggle"]).spawn();
-                            }
+                        ctrl.store(value != 0, Ordering::SeqCst);
+                        if value == 0 && recording.load(Ordering::SeqCst) {
+                            toggle(&recording);
                         }
                     }
 
                     if is_alt {
-                        if value != 0 && !alt.swap(true, Ordering::SeqCst) {
-                            if ctrl.load(Ordering::SeqCst)
-                                && !recording.swap(true, Ordering::SeqCst)
-                            {
-                                let _ = Command::new(WHISRS).args(["toggle"]).spawn();
-                            }
-                        } else if value == 0 && alt.swap(false, Ordering::SeqCst) {
-                            if recording.swap(false, Ordering::SeqCst) {
-                                let _ = Command::new(WHISRS).args(["toggle"]).spawn();
-                            }
+                        alt.store(value != 0, Ordering::SeqCst);
+                        if value == 0 && recording.load(Ordering::SeqCst) {
+                            toggle(&recording);
+                        }
+                    }
+
+                    if value != 0 && ctrl.load(Ordering::SeqCst) && alt.load(Ordering::SeqCst) {
+                        if !recording.load(Ordering::SeqCst) {
+                            toggle(&recording);
                         }
                     }
                 }
